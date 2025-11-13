@@ -83,10 +83,10 @@ class BM25Index:
         tf = Counter(toks)
         score = 0.0
         for t in q_toks:
-            if t not in self.idf: 
+            if t not in self.idf:
                 continue
             f = tf.get(t, 0)
-            if f == 0: 
+            if f == 0:
                 continue
             idf = self.idf[t]
             denom = f + self.k1 * (1 - self.b + self.b * dl / (self.avgdl + 1e-9))
@@ -127,7 +127,7 @@ class BM25Index:
         idx.vocab_df = d["vocab_df"]
         return idx
 
-# ========== Embeddings / ANN ==========
+# ========== Embeddings (dense) ==========
 def get_embedder(model_name: str):
     try:
         from sentence_transformers import SentenceTransformer
@@ -137,46 +137,14 @@ def get_embedder(model_name: str):
     return m
 
 def encode_texts(embedder, texts: List[str], batch_size: int = 64) -> np.ndarray:
-    vecs = embedder.encode(texts, batch_size=batch_size, convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False)
+    vecs = embedder.encode(
+        texts,
+        batch_size=batch_size,
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+        show_progress_bar=False
+    )
     return vecs.astype(np.float32)
-
-class ANN:
-    def __init__(self, dim: int):
-        self.dim = dim
-        self.use_hnsw = False
-        self.index = None
-        self.vecs = None
-
-    def build(self, vecs: np.ndarray, M: int = 64, efC: int = 300):
-        # пытаемся hnswlib
-        try:
-            import hnswlib
-            self.index = hnswlib.Index(space='cosine', dim=self.dim)
-            self.index.init_index(max_elements=vecs.shape[0], ef_construction=efC, M=M)
-            self.index.add_items(vecs, np.arange(vecs.shape[0]))
-            self.index.set_ef(200)
-            self.use_hnsw = True
-        except Exception:
-            self.vecs = vecs
-            self.use_hnsw = False
-
-    def query(self, q: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
-        if self.use_hnsw:
-            labels, dists = self.index.knn_query(q, k=k)
-            # hnswlib cosine gives smaller distance for closer; convert to similarity ~ 1 - dist
-            sims = 1.0 - dists
-            return labels, sims
-        else:
-            # brute-force dot product on normalized vectors = cosine
-            sims = self.vecs @ q.T  # [N, B]
-            # for single vector q: shape [N, 1]
-            if sims.ndim == 2 and sims.shape[1] == 1:
-                sims = sims[:, 0]
-                idx = np.argpartition(-sims, np.arange(min(k, sims.shape[0])))[:k]
-                idx_sorted = idx[np.argsort(-sims[idx])]
-                return idx_sorted.reshape(1, -1), sims[idx_sorted].reshape(1, -1)
-            else:
-                raise ValueError("Batch queries not supported in brute force mode")
 
 # ========== 1) BUILD-INDEX ==========
 def cmd_build_index(args):
@@ -200,11 +168,27 @@ def cmd_build_index(args):
 
         for idx, (i, j, chunk) in enumerate(sliding_windows(text, h1_size, h1_ov)):
             chunk_id = f"{web_id}#h1#{idx:05d}"
-            chunks.append({"chunk_id":chunk_id,"web_id":web_id,"title":title,"url":url,"type":typ,"text":chunk,"level":"h1"})
-            
+            chunks.append({
+                "chunk_id": chunk_id,
+                "web_id": web_id,
+                "title": title,
+                "url": url,
+                "type": typ,
+                "text": chunk,
+                "level": "h1"
+            })
+
         for idx, (i, j, chunk) in enumerate(sliding_windows(text, h2_size, h2_ov)):
             chunk_id = f"{web_id}#h2#{idx:05d}"
-            chunks.append({"chunk_id":chunk_id,"web_id":web_id,"title":title,"url":url,"type":typ,"text":chunk,"level":"h2"})
+            chunks.append({
+                "chunk_id": chunk_id,
+                "web_id": web_id,
+                "title": title,
+                "url": url,
+                "type": typ,
+                "text": chunk,
+                "level": "h2"
+            })
 
     chunks_path = os.path.join(args.out_dir, "chunks.jsonl")
     with open(chunks_path, "w", encoding="utf-8") as f:
@@ -212,8 +196,9 @@ def cmd_build_index(args):
             f.write(json.dumps(ch, ensure_ascii=False) + "\n")
     print(f"[build] chunks saved: {chunks_path} ({len(chunks)} chunks)")
 
+    # BM25 токены
     for ch in chunks:
-        toks = tokenize(((ch["title"]+" ") * 3) + ((ch["url"]+" ") * 2) + ch["text"])
+        toks = tokenize(((ch["title"] + " ") * 3) + ((ch["url"] + " ") * 2) + ch["text"])
         bm25_docs_tokens.append(toks)
     bm25 = BM25Index(k1=args.k1, b=args.b)
     bm25.build(bm25_docs_tokens)
@@ -221,10 +206,10 @@ def cmd_build_index(args):
     bm25.save(bm25_path)
     print(f"[build] bm25 index saved: {bm25_path} (avgdl={bm25.avgdl:.2f}, vocab={len(bm25.idf)})")
 
-    # Embeddings for H1/H2 separately
+    # Embeddings for H1/H2 separately (plain dense, без ANN)
     embedder = get_embedder(args.embed_model)
-    texts_h1 = [ch["text"] for ch in chunks if ch["level"]=="h1"]
-    texts_h2 = [ch["text"] for ch in chunks if ch["level"]=="h2"]
+    texts_h1 = [ch["text"] for ch in chunks if ch["level"] == "h1"]
+    texts_h2 = [ch["text"] for ch in chunks if ch["level"] == "h2"]
     print(f"[build] encoding H1 ({len(texts_h1)})")
     emb_h1 = encode_texts(embedder, texts_h1, batch_size=args.batch)
     print(f"[build] encoding H2 ({len(texts_h2)})")
@@ -232,16 +217,16 @@ def cmd_build_index(args):
     np.save(os.path.join(args.out_dir, "emb_h1.npy"), emb_h1)
     np.save(os.path.join(args.out_dir, "emb_h2.npy"), emb_h2)
 
-    # maps
+    # maps для соответствия chunk_id ↔ индекс в emb_h1/emb_h2
     idx_h1, idx_h2 = {}, {}
     i1 = 0
     for ch in chunks:
-        if ch["level"]=="h1":
+        if ch["level"] == "h1":
             idx_h1[ch["chunk_id"]] = i1
             i1 += 1
     i2 = 0
     for ch in chunks:
-        if ch["level"]=="h2":
+        if ch["level"] == "h2":
             idx_h2[ch["chunk_id"]] = i2
             i2 += 1
     with open(os.path.join(args.out_dir, "idx_h1.json"), "w", encoding="utf-8") as f:
@@ -268,56 +253,74 @@ def rank_list(ids: List[str], scores: List[float]) -> Dict[str,int]:
     order = np.argsort(-np.array(scores))
     return {ids[i]: int(pos+1) for pos, i in enumerate(order)}
 
-def build_ann_from_disk(out_dir: str, level: str):
-    emb = np.load(os.path.join(out_dir, f"emb_{level}.npy"))
-    ann = ANN(dim=emb.shape[1]); ann.build(emb, M=64, efC=300)
-    return ann, emb
-
 def cmd_retrieve(args):
     out_dir = args.index_dir
     chunks = load_chunks(os.path.join(out_dir, "chunks.jsonl"))
     bm25 = BM25Index.load(os.path.join(out_dir, "bm25_index.pkl"))
 
-    chunk_ids_h1 = [ch["chunk_id"] for ch in chunks if ch["level"]=="h1"]
-    chunk_ids_h2 = [ch["chunk_id"] for ch in chunks if ch["level"]=="h2"]
+    chunk_ids_h1 = [ch["chunk_id"] for ch in chunks if ch["level"] == "h1"]
+    chunk_ids_h2 = [ch["chunk_id"] for ch in chunks if ch["level"] == "h2"]
     title_by_chunk = {ch["chunk_id"]: ch["title"] for ch in chunks}
     doc_by_chunk = {ch["chunk_id"]: ch["web_id"] for ch in chunks}
 
-    ann_h1, emb_h1 = build_ann_from_disk(out_dir, "h1")
-    ann_h2, emb_h2 = build_ann_from_disk(out_dir, "h2")
+    # грузим эмбеддинги с диска
+    emb_h1 = np.load(os.path.join(out_dir, "emb_h1.npy"))
+    emb_h2 = np.load(os.path.join(out_dir, "emb_h2.npy"))
+
+    # на случай, если там один вектор и shape == (D,)
+    if emb_h1.ndim == 1:
+        emb_h1 = emb_h1.reshape(1, -1)
+    if emb_h2.ndim == 1:
+        emb_h2 = emb_h2.reshape(1, -1)
 
     embedder = get_embedder(args.embed_model)
 
     qs = pd.read_csv(args.questions)
     rows_out = []
     print(f"[retrieve] queries: {len(qs)}")
+
+    all_chunk_ids = [ch["chunk_id"] for ch in chunks]
+
     for _, row in qs.iterrows():
         qid = row["q_id"]
         query = normalize_text(str(row["query"]))
         q_tok = tokenize(query)
 
-        all_chunk_ids = [ch["chunk_id"] for ch in chunks]
+        # --- BM25 (lexical) ---
         top_lex = bm25.top_k(q_tok, k=args.top_lex)
         lex_ids = [all_chunk_ids[i] for i, s in top_lex]
         lex_scores = [s for i, s in top_lex]
         rank_lex = rank_list(lex_ids, lex_scores)
 
-        # --- Dense H1 ---
-        q_vec = encode_texts(embedder, [query])[0].reshape(1, -1).astype(np.float32)
-        labels_h1, sims_h1 = ann_h1.query(q_vec, k=min(args.top_dense//2, len(chunk_ids_h1)))
-        ids_h1 = [chunk_ids_h1[i] for i in labels_h1[0]]
-        sc_h1 = sims_h1[0].tolist()
-        rank_h1 = rank_list(ids_h1, sc_h1)
+        # --- Dense H1/H2 (brute-force по emb_h1/emb_h2) ---
+        q_vec = encode_texts(embedder, [query])[0].astype(np.float32)  # (D,)
+        # H1
+        ids_h1, sc_h1, rank_h1 = [], [], {}
+        if len(chunk_ids_h1) > 0 and args.top_dense > 0:
+            sims_h1 = emb_h1 @ q_vec  # [num_h1]
+            k_h1 = min(args.top_dense // 2, len(chunk_ids_h1))
+            if k_h1 > 0:
+                idx_top_h1 = np.argpartition(-sims_h1, k_h1 - 1)[:k_h1]
+                idx_top_h1 = idx_top_h1[np.argsort(-sims_h1[idx_top_h1])]
+                ids_h1 = [chunk_ids_h1[i] for i in idx_top_h1]
+                sc_h1 = sims_h1[idx_top_h1].tolist()
+                rank_h1 = rank_list(ids_h1, sc_h1)
+        # H2
+        ids_h2, sc_h2, rank_h2 = [], [], {}
+        if len(chunk_ids_h2) > 0 and args.top_dense > 0:
+            sims_h2 = emb_h2 @ q_vec  # [num_h2]
+            k_h2 = min(args.top_dense // 2, len(chunk_ids_h2))
+            if k_h2 > 0:
+                idx_top_h2 = np.argpartition(-sims_h2, k_h2 - 1)[:k_h2]
+                idx_top_h2 = idx_top_h2[np.argsort(-sims_h2[idx_top_h2])]
+                ids_h2 = [chunk_ids_h2[i] for i in idx_top_h2]
+                sc_h2 = sims_h2[idx_top_h2].tolist()
+                rank_h2 = rank_list(ids_h2, sc_h2)
 
-        labels_h2, sims_h2 = ann_h2.query(q_vec, k=min(args.top_dense//2, len(chunk_ids_h2)))
-        ids_h2 = [chunk_ids_h2[i] for i in labels_h2[0]]
-        sc_h2 = sims_h2[0].tolist()
-        rank_h2 = rank_list(ids_h2, sc_h2)
-
+        # RRF по BM25 + dense_h1 + dense_h2
         rrf = rrf_fusion([rank_lex, rank_h1, rank_h2], k=args.rrf_k)
 
         cand_ids = set(lex_ids) | set(ids_h1) | set(ids_h2)
-
         cand_sorted = sorted(cand_ids, key=lambda cid: rrf.get(cid, 0.0), reverse=True)[:args.pool_size]
 
         bm25_map = {cid: 0.0 for cid in cand_sorted}
@@ -471,8 +474,6 @@ def main():
     b.add_argument("--b", type=float, default=0.35)
     b.add_argument("--embed-model", default="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
     b.add_argument("--batch", type=int, default=64)
-    b.add_argument("--hnsw-M", type=int, default=64)
-    b.add_argument("--hnsw-efC", type=int, default=300)
     b.set_defaults(func=cmd_build_index)
 
     r = sub.add_parser("retrieve", help="BM25+Dense → union → RRF → candidates.csv")
