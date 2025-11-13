@@ -77,8 +77,8 @@ class BM25Index:
         self.idf = {t: math.log((N - df_t + 0.5) / (df_t + 0.5) + 1.0) for t, df_t in df.items()}
         self.avgdl = np.mean([len(toks) for toks in docs_tokens]) if N else 0.0
 
-    def score(self, q_toks: List[str], doc_idx: int) -> float:
-        toks = self.doc_tokens[doc_idx]
+    def score(self, q_toks: List[str], web_idx: int) -> float:
+        toks = self.doc_tokens[web_idx]
         dl = len(toks) + 1e-9
         tf = Counter(toks)
         score = 0.0
@@ -192,28 +192,26 @@ def cmd_build_index(args):
 
     print(f"[build] reading {len(df)} docs, chunking H1={h1_size}/{h1_ov}, H2={h2_size}/{h2_ov}")
     for _, row in df.iterrows():
-        doc_id = str(row["web_id"])
+        web_id = str(row["web_id"])
         title = normalize_text(str(row["title"]))
         url = normalize_text(str(row["url"]))
         typ = str(row["kind"])
         text = normalize_text(str(row["text"]))
-        # H1
-        for idx, (i, j, chunk) in enumerate(sliding_windows(text, h1_size, h1_ov)):
-            chunk_id = f"{doc_id}#h1#{idx:05d}"
-            chunks.append({"chunk_id":chunk_id,"doc_id":doc_id,"title":title,"url":url,"type":typ,"text":chunk,"level":"h1"})
-        # H2
-        for idx, (i, j, chunk) in enumerate(sliding_windows(text, h2_size, h2_ov)):
-            chunk_id = f"{doc_id}#h2#{idx:05d}"
-            chunks.append({"chunk_id":chunk_id,"doc_id":doc_id,"title":title,"url":url,"type":typ,"text":chunk,"level":"h2"})
 
-    # save chunks.jsonl
+        for idx, (i, j, chunk) in enumerate(sliding_windows(text, h1_size, h1_ov)):
+            chunk_id = f"{web_id}#h1#{idx:05d}"
+            chunks.append({"chunk_id":chunk_id,"web_id":web_id,"title":title,"url":url,"type":typ,"text":chunk,"level":"h1"})
+            
+        for idx, (i, j, chunk) in enumerate(sliding_windows(text, h2_size, h2_ov)):
+            chunk_id = f"{web_id}#h2#{idx:05d}"
+            chunks.append({"chunk_id":chunk_id,"web_id":web_id,"title":title,"url":url,"type":typ,"text":chunk,"level":"h2"})
+
     chunks_path = os.path.join(args.out_dir, "chunks.jsonl")
     with open(chunks_path, "w", encoding="utf-8") as f:
         for ch in chunks:
             f.write(json.dumps(ch, ensure_ascii=False) + "\n")
     print(f"[build] chunks saved: {chunks_path} ({len(chunks)} chunks)")
 
-    # BM25 over title^3 + url^2 + text^1
     for ch in chunks:
         toks = tokenize(((ch["title"]+" ") * 3) + ((ch["url"]+" ") * 2) + ch["text"])
         bm25_docs_tokens.append(toks)
@@ -267,7 +265,6 @@ def rrf_fusion(rank_dicts: List[Dict[str,int]], k: int = 60) -> Dict[str, float]
     return scores
 
 def rank_list(ids: List[str], scores: List[float]) -> Dict[str,int]:
-    # return rank positions (1-based)
     order = np.argsort(-np.array(scores))
     return {ids[i]: int(pos+1) for pos, i in enumerate(order)}
 
@@ -281,17 +278,14 @@ def cmd_retrieve(args):
     chunks = load_chunks(os.path.join(out_dir, "chunks.jsonl"))
     bm25 = BM25Index.load(os.path.join(out_dir, "bm25_index.pkl"))
 
-    # Split chunk_id lists by level
     chunk_ids_h1 = [ch["chunk_id"] for ch in chunks if ch["level"]=="h1"]
     chunk_ids_h2 = [ch["chunk_id"] for ch in chunks if ch["level"]=="h2"]
     title_by_chunk = {ch["chunk_id"]: ch["title"] for ch in chunks}
-    doc_by_chunk = {ch["chunk_id"]: ch["doc_id"] for ch in chunks}
+    doc_by_chunk = {ch["chunk_id"]: ch["web_id"] for ch in chunks}
 
-    # Build/reload ANN
     ann_h1, emb_h1 = build_ann_from_disk(out_dir, "h1")
     ann_h2, emb_h2 = build_ann_from_disk(out_dir, "h2")
 
-    # Embedder for queries
     embedder = get_embedder(args.embed_model)
 
     qs = pd.read_csv(args.questions)
@@ -302,11 +296,8 @@ def cmd_retrieve(args):
         query = normalize_text(str(row["query"]))
         q_tok = tokenize(query)
 
-        # --- BM25 over all chunks (order matches bm25.doc_tokens, which aligned with chunks order) ---
-        # build a mapping from bm25-doc-index to chunk_id: bm25 built on [all chunks in file order]
-        # we reconstruct list in same order:
         all_chunk_ids = [ch["chunk_id"] for ch in chunks]
-        top_lex = bm25.top_k(q_tok, k=args.top_lex)  # list of (doc_idx, score)
+        top_lex = bm25.top_k(q_tok, k=args.top_lex)
         lex_ids = [all_chunk_ids[i] for i, s in top_lex]
         lex_scores = [s for i, s in top_lex]
         rank_lex = rank_list(lex_ids, lex_scores)
@@ -318,31 +309,26 @@ def cmd_retrieve(args):
         sc_h1 = sims_h1[0].tolist()
         rank_h1 = rank_list(ids_h1, sc_h1)
 
-        # --- Dense H2 ---
         labels_h2, sims_h2 = ann_h2.query(q_vec, k=min(args.top_dense//2, len(chunk_ids_h2)))
         ids_h2 = [chunk_ids_h2[i] for i in labels_h2[0]]
         sc_h2 = sims_h2[0].tolist()
         rank_h2 = rank_list(ids_h2, sc_h2)
 
-        # --- RRF fusion ---
         rrf = rrf_fusion([rank_lex, rank_h1, rank_h2], k=args.rrf_k)
 
-        # collect union of ids
         cand_ids = set(lex_ids) | set(ids_h1) | set(ids_h2)
-        # cut to ~800 by RRF
+
         cand_sorted = sorted(cand_ids, key=lambda cid: rrf.get(cid, 0.0), reverse=True)[:args.pool_size]
 
-        # precompute per-query minmax for scores
         bm25_map = {cid: 0.0 for cid in cand_sorted}
         dense_h1_map = {cid: 0.0 for cid in cand_sorted}
         dense_h2_map = {cid: 0.0 for cid in cand_sorted}
         rrf_map = {cid: rrf.get(cid, 0.0) for cid in cand_sorted}
 
-        # fill bm25
         lex_map = {cid: sc for cid, sc in zip(lex_ids, lex_scores)}
         for cid in cand_sorted:
             bm25_map[cid] = float(lex_map.get(cid, 0.0))
-        # fill dense
+
         h1_map = {cid: sc for cid, sc in zip(ids_h1, sc_h1)}
         h2_map = {cid: sc for cid, sc in zip(ids_h2, sc_h2)}
         for cid in cand_sorted:
@@ -357,7 +343,7 @@ def cmd_retrieve(args):
             rows_out.append({
                 "q_id": qid,
                 "chunk_id": cid,
-                "doc_id": doc_by_chunk[cid],
+                "web_id": doc_by_chunk[cid],
                 "bm25": bm25_map[cid],
                 "dense_h1": dense_h1_map[cid],
                 "dense_h2": dense_h2_map[cid],
@@ -412,7 +398,7 @@ def cmd_aggregate(args):
     rows = []
     for qid, grp in df.groupby("q_id"):
         doc_scores = {}
-        for doc_id, g2 in grp.groupby("doc_id"):
+        for web_id, g2 in grp.groupby("web_id"):
             g2s = g2.sort_values("score_chunk", ascending=False).head(args.topn)
             sc = g2s["score_chunk"].to_numpy(float)
             if args.mode == "logsumexp3":
@@ -423,11 +409,11 @@ def cmd_aggregate(args):
                 agg = float(np.max(sc))
             else:
                 raise ValueError("unknown mode")
-            doc_scores[doc_id] = agg
-        # top-k docs
+            doc_scores[web_id] = agg
+
         top_docs = sorted(doc_scores.items(), key=lambda x: x[1], reverse=True)
-        for doc_id, agg_score in top_docs:
-            rows.append({"q_id": qid, "doc_id": doc_id, "agg_score": agg_score})
+        for web_id, agg_score in top_docs:
+            rows.append({"q_id": qid, "web_id": web_id, "agg_score": agg_score})
 
     out = pd.DataFrame(rows)
     out.to_csv(args.out_docs, index=False)
@@ -435,18 +421,36 @@ def cmd_aggregate(args):
 
 # ========== 5) SUBMIT ==========
 def cmd_submit(args):
+    import json
     df = pd.read_csv(args.docs)
     out_rows = []
+    K = args.k
+
     for qid, grp in df.groupby("q_id"):
-        top = grp.sort_values("agg_score", ascending=False).head(args.k)["doc_id"].astype(str).tolist()
-        seen, uniq = set(), []
-        for d in top:
-            if d in seen: 
-                continue
-            uniq.append(d); seen.add(d)
-        while len(uniq) < args.k:
-            uniq.append("")
-        out_rows.append({"q_id": qid, "doc_list": " ".join(uniq[:args.k])})
+        top_docs = (grp.sort_values("agg_score", ascending=False)
+                       .loc[:, "web_id"].astype(str).tolist())
+
+        seen = set()
+        uniq = []
+        for d in top_docs:
+            if d not in seen:
+                uniq.append(d); seen.add(d)
+
+        if len(uniq) == 0:
+            uniq = ["0"] * K
+        while len(uniq) < K:
+            uniq.append(uniq[-1])
+
+        def to_int_safe(x):
+            try: return int(x)
+            except: return x
+        web_list = [to_int_safe(x) for x in uniq[:K]]
+
+        out_rows.append({
+            "q_id": int(qid),
+            "web_list": json.dumps(web_list, ensure_ascii=False)  # "[1, 2, 3, 4, 5]"
+        })
+
     sub = pd.DataFrame(out_rows)
     sub.to_csv(args.out, index=False)
     print(f"[submit] saved: {args.out}")
@@ -457,7 +461,7 @@ def main():
     sub = p.add_subparsers(dest="cmd", required=True)
 
     b = sub.add_parser("build-index", help="Ingest → Chunk → BM25+Embeddings")
-    b.add_argument("--corpus", required=True, help="CSV with columns: doc_id,url,title,type,text")
+    b.add_argument("--corpus", required=True, help="CSV with columns: web_id,url,title,type,text")
     b.add_argument("--out-dir", required=True)
     b.add_argument("--h1-size", type=int, default=1000)
     b.add_argument("--h1-overlap", type=int, default=200)
