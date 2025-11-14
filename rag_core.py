@@ -34,7 +34,6 @@ def sliding_windows(text: str, size: int, overlap: int) -> List[Tuple[int,int,st
     n = len(text)
     while i < n:
         j = min(n, i + size)
-        # расширяем до ближайшей границы по пробелу
         if j < n:
             k = text.rfind(" ", i, j)
             if k != -1 and k > i + size*0.6:
@@ -54,6 +53,85 @@ def minmax_scale(x: np.ndarray) -> np.ndarray:
     mn, mx = float(np.min(x)), float(np.max(x))
     if mx - mn < 1e-12: return np.zeros_like(x)
     return (x - mn) / (mx - mn)
+
+# ========== Evaluation helpers ==========
+def load_qrels(path: str) -> Dict[str, set]:
+    """
+    Ожидаем CSV с колонками: q_id, web_id
+    q_id и web_id приводим к строкам.
+    """
+    df = pd.read_csv(path)
+    if "q_id" not in df.columns or "web_id" not in df.columns:
+        raise ValueError("qrels CSV must have columns: q_id, web_id")
+    qrels = defaultdict(set)
+    for _, row in df.iterrows():
+        qid = str(row["q_id"])
+        wid = str(row["web_id"])
+        qrels[qid].add(wid)
+    return dict(qrels)
+
+def eval_pool_recall(df_cand: pd.DataFrame, qrels: Dict[str, set]) -> Tuple[float, int]:
+    """
+    PoolRecall: для каждого q_id смотрим, попал ли хотя бы один релевантный web_id
+    в множество всех web_id в candidates.
+    """
+    hits = 0
+    total = 0
+    for qid, grp in df_cand.groupby("q_id"):
+        qid_str = str(qid)
+        if qid_str not in qrels:
+            continue
+        total += 1
+        pred_docs = set(grp["web_id"].astype(str))
+        if pred_docs & qrels[qid_str]:
+            hits += 1
+    return (hits / total if total > 0 else 0.0), total
+
+def eval_hit_at_k_from_docs(
+    df_docs: pd.DataFrame,
+    qrels: Dict[str, set],
+    k: int = 5,
+    score_col: str = "agg_score"
+) -> Tuple[float, int]:
+    """
+    Hit@K по документам: df_docs содержит строки (q_id, web_id, score_col).
+    """
+    hits = 0
+    total = 0
+    for qid, grp in df_docs.groupby("q_id"):
+        qid_str = str(qid)
+        if qid_str not in qrels:
+            continue
+        total += 1
+        topk = (grp.sort_values(score_col, ascending=False)
+                    .head(k)["web_id"].astype(str).tolist())
+        if any(w in qrels[qid_str] for w in topk):
+            hits += 1
+    return (hits / total if total > 0 else 0.0), total
+
+def eval_hit_at_k_from_submit(
+    df_sub: pd.DataFrame,
+    qrels: Dict[str, set],
+    k: int = 5
+) -> Tuple[float, int]:
+    """
+    Hit@K по финальному submit: q_id, web_list (JSON).
+    """
+    hits = 0
+    total = 0
+    for _, row in df_sub.iterrows():
+        qid_str = str(row["q_id"])
+        if qid_str not in qrels:
+            continue
+        total += 1
+        try:
+            web_list = json.loads(row["web_list"])
+        except Exception:
+            continue
+        web_list_str = [str(w) for w in web_list[:k]]
+        if any(w in qrels[qid_str] for w in web_list_str):
+            hits += 1
+    return (hits / total if total > 0 else 0.0), total
 
 # ========== BM25 (простая реализация + сериализация) ==========
 @dataclass
@@ -148,6 +226,7 @@ def encode_texts(embedder, texts: List[str], batch_size: int = 64) -> np.ndarray
 
 # ========== 1) BUILD-INDEX ==========
 def cmd_build_index(args):
+    t0 = time.time()
     os.makedirs(args.out_dir, exist_ok=True)
     df = pd.read_csv(args.corpus)
     needed = {"web_id","title","url","kind","text"}
@@ -234,6 +313,8 @@ def cmd_build_index(args):
     with open(os.path.join(args.out_dir, "idx_h2.json"), "w", encoding="utf-8") as f:
         json.dump(idx_h2, f, ensure_ascii=False)
 
+    print(f"[build] done in {time.time() - t0:.1f}s")
+
 # ========== 2) RETRIEVE ==========
 def load_chunks(path: str) -> List[Dict]:
     out = []
@@ -254,6 +335,7 @@ def rank_list(ids: List[str], scores: List[float]) -> Dict[str,int]:
     return {ids[i]: int(pos+1) for pos, i in enumerate(order)}
 
 def cmd_retrieve(args):
+    t0 = time.time()
     out_dir = args.index_dir
     chunks = load_chunks(os.path.join(out_dir, "chunks.jsonl"))
     bm25 = BM25Index.load(os.path.join(out_dir, "bm25_index.pkl"))
@@ -294,6 +376,7 @@ def cmd_retrieve(args):
 
         # --- Dense H1/H2 (brute-force по emb_h1/emb_h2) ---
         q_vec = encode_texts(embedder, [query])[0].astype(np.float32)  # (D,)
+
         # H1
         ids_h1, sc_h1, rank_h1 = [], [], {}
         if len(chunk_ids_h1) > 0 and args.top_dense > 0:
@@ -305,6 +388,7 @@ def cmd_retrieve(args):
                 ids_h1 = [chunk_ids_h1[i] for i in idx_top_h1]
                 sc_h1 = sims_h1[idx_top_h1].tolist()
                 rank_h1 = rank_list(ids_h1, sc_h1)
+
         # H2
         ids_h2, sc_h2, rank_h2 = [], [], {}
         if len(chunk_ids_h2) > 0 and args.top_dense > 0:
@@ -355,11 +439,20 @@ def cmd_retrieve(args):
             })
 
     out_path = args.out_candidates
-    pd.DataFrame(rows_out).to_csv(out_path, index=False)
+    df_cand = pd.DataFrame(rows_out)
+    df_cand.to_csv(out_path, index=False)
     print(f"[retrieve] saved candidates: {out_path} ({len(rows_out)} rows)")
+    print(f"[retrieve] done in {time.time() - t0:.1f}s")
+
+    # === EVAL: PoolRecall на уровне пулла кандидатов ===
+    if getattr(args, "qrels", None):
+        qrels = load_qrels(args.qrels)
+        pool_recall, n = eval_pool_recall(df_cand, qrels)
+        print(f"[retrieve][eval] pool_recall={pool_recall:.4f} over {n} queries")
 
 # ========== 3) RERANK (light mix) ==========
 def cmd_rerank(args):
+    t0 = time.time()
     df = pd.read_csv(args.candidates)
     weights = json.loads(args.weights)
     alpha = weights.get("alpha", 0.6)
@@ -387,6 +480,7 @@ def cmd_rerank(args):
     out = pd.concat(rows, ignore_index=True)
     out.to_csv(args.out_chunks, index=False)
     print(f"[rerank] saved: {args.out_chunks}")
+    print(f"[rerank] done in {time.time() - t0:.1f}s")
 
 # ========== 4) AGGREGATE ==========
 def logsumexp(a: np.ndarray, axis=None, keepdims=False):
@@ -397,6 +491,7 @@ def logsumexp(a: np.ndarray, axis=None, keepdims=False):
     return out
 
 def cmd_aggregate(args):
+    t0 = time.time()
     df = pd.read_csv(args.rerank)
     rows = []
     for qid, grp in df.groupby("q_id"):
@@ -421,10 +516,18 @@ def cmd_aggregate(args):
     out = pd.DataFrame(rows)
     out.to_csv(args.out_docs, index=False)
     print(f"[aggregate] saved: {args.out_docs}")
+    print(f"[aggregate] done in {time.time() - t0:.1f}s")
+
+    # === EVAL: Hit@5 на уровне doc-ранжирования по agg_score ===
+    if getattr(args, "qrels", None):
+        qrels = load_qrels(args.qrels)
+        hit5, n = eval_hit_at_k_from_docs(out, qrels, k=5, score_col="agg_score")
+        print(f"[aggregate][eval] hit@5={hit5:.4f} over {n} queries")
 
 # ========== 5) SUBMIT ==========
 def cmd_submit(args):
     import json
+    t0 = time.time()
     df = pd.read_csv(args.docs)
     out_rows = []
     K = args.k
@@ -457,6 +560,13 @@ def cmd_submit(args):
     sub = pd.DataFrame(out_rows)
     sub.to_csv(args.out, index=False)
     print(f"[submit] saved: {args.out}")
+    print(f"[submit] done in {time.time() - t0:.1f}s")
+
+    # === EVAL: финальный Hit@5 по web_list ===
+    if getattr(args, "qrels", None):
+        qrels = load_qrels(args.qrels)
+        hit5, n = eval_hit_at_k_from_submit(sub, qrels, k=K)
+        print(f"[submit][eval] final hit@{K}={hit5:.4f} over {n} queries")
 
 # ========== CLI ==========
 def main():
@@ -485,6 +595,7 @@ def main():
     r.add_argument("--rrf-k", type=int, default=60)
     r.add_argument("--pool-size", type=int, default=800)
     r.add_argument("--out-candidates", required=True)
+    r.add_argument("--qrels", help="CSV with columns: q_id,web_id for evaluation", default=None)
     r.set_defaults(func=cmd_retrieve)
 
     rr = sub.add_parser("rerank", help="Light mix → score_chunk")
@@ -498,12 +609,14 @@ def main():
     ag.add_argument("--mode", choices=["logsumexp3","sum3","max"], default="logsumexp3")
     ag.add_argument("--topn", type=int, default=3)
     ag.add_argument("--out-docs", required=True)
+    ag.add_argument("--qrels", help="CSV with columns: q_id,web_id for evaluation", default=None)
     ag.set_defaults(func=cmd_aggregate)
 
     sb = sub.add_parser("submit", help="Top-K docs → submit.csv")
     sb.add_argument("--docs", required=True)
     sb.add_argument("--k", type=int, default=5)
     sb.add_argument("--out", required=True)
+    sb.add_argument("--qrels", help="CSV with columns: q_id,web_id for evaluation", default=None)
     sb.set_defaults(func=cmd_submit)
 
     args = p.parse_args()
