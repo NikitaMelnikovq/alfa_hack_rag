@@ -14,7 +14,8 @@ RU_STOP = set("""
 """.split())
 
 def normalize_text(s: str) -> str:
-    if s is None: return ""
+    if s is None:
+        return ""
     s = s.replace("\u00A0", " ")
     s = _WS.sub(" ", s)
     return s.strip()
@@ -26,7 +27,12 @@ def tokenize(s: str) -> List[str]:
     return toks
 
 def sliding_windows(text: str, size: int, overlap: int) -> List[Tuple[int,int,str]]:
-    if not text: return []
+    """
+    Старый оконный сплиттер — сейчас не используется,
+    но оставил на всякий случай, если захочешь сравнить.
+    """
+    if not text:
+        return []
     assert size > 0
     step = max(1, size - overlap)
     out = []
@@ -49,12 +55,122 @@ def l2_normalize(mat: np.ndarray) -> np.ndarray:
     return mat / norms
 
 def minmax_scale(x: np.ndarray) -> np.ndarray:
-    if x.size == 0: return x
+    if x.size == 0:
+        return x
     mn, mx = float(np.min(x)), float(np.max(x))
-    if mx - mn < 1e-12: return np.zeros_like(x)
+    if mx - mn < 1e-12:
+        return np.zeros_like(x)
     return (x - mn) / (mx - mn)
 
+# ========== Semantic splitter ==========
+
+def split_into_sentences(text: str) -> List[str]:
+    """
+    Грубый сплиттер под ру/банковские тексты:
+    - режем по переносам строк
+    - внутри строк режем по .?!, если есть пробел после знака
+    - склеиваем слишком короткие куски с предыдущими
+    """
+    if not text:
+        return []
+
+    # сначала по строкам
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    sents: List[str] = []
+
+    for line in lines:
+        # грубо бьём по концам предложений
+        parts = re.split(r'(?<=[\.\?\!])\s+', line)
+        for p in parts:
+            p = p.strip()
+            if p:
+                sents.append(p)
+
+    # склеиваем совсем короткое с предыдущим
+    merged: List[str] = []
+    buf = ""
+    for s in sents:
+        if len(s) < 40:
+            if buf:
+                buf = buf + " " + s
+            else:
+                buf = s
+        else:
+            if buf:
+                merged.append(buf)
+                buf = ""
+            merged.append(s)
+    if buf:
+        merged.append(buf)
+
+    return merged
+
+def semantic_split(
+    text: str,
+    embedder,
+    max_chars: int = 800,
+    min_chars: int = 250,
+    sim_threshold: float = 0.6,
+    batch_size: int = 32,
+) -> List[str]:
+    """
+    Семантический сплиттер:
+    - сначала бьём на предложения
+    - считаем эмбеддинги предложений
+    - идём слева направо и начинаем новый чанк, когда:
+        * длина текущего чанка > max_chars
+        * ИЛИ (cos sim с предыдущим предложением < sim_threshold и текущий чанк уже >= min_chars)
+    """
+    text = normalize_text(text)
+    if not text:
+        return []
+
+    sents = split_into_sentences(text)
+    if not sents:
+        return []
+
+    # эмбеддинги предложений
+    sent_vecs = encode_texts(embedder, sents, batch_size=batch_size)
+    sent_vecs = l2_normalize(sent_vecs)
+
+    chunks: List[str] = []
+    cur_sents: List[str] = []
+    cur_len = 0
+
+    def flush_chunk():
+        nonlocal cur_sents, cur_len
+        if cur_sents:
+            chunk_text = " ".join(cur_sents).strip()
+            if chunk_text:
+                chunks.append(chunk_text)
+        cur_sents = []
+        cur_len = 0
+
+    prev_vec = None
+    for sent, vec in zip(sents, sent_vecs):
+        s_len = len(sent)
+        sim = None
+        if prev_vec is not None:
+            sim = float(np.dot(prev_vec, vec))
+
+        need_new = False
+        if cur_len >= max_chars:
+            need_new = True
+        elif sim is not None and sim < sim_threshold and cur_len >= min_chars:
+            need_new = True
+
+        if need_new:
+            flush_chunk()
+
+        cur_sents.append(sent)
+        cur_len += s_len + 1
+        prev_vec = vec
+
+    flush_chunk()
+    return chunks
+
 # ========== Evaluation helpers ==========
+
 def load_qrels(path: str) -> Dict[str, set]:
     """
     Ожидаем CSV с колонками: q_id, web_id
@@ -134,6 +250,7 @@ def eval_hit_at_k_from_submit(
     return (hits / total if total > 0 else 0.0), total
 
 # ========== BM25 (простая реализация + сериализация) ==========
+
 @dataclass
 class BM25Index:
     doc_tokens: List[List[str]] = field(default_factory=list)
@@ -206,6 +323,7 @@ class BM25Index:
         return idx
 
 # ========== Embeddings (dense) ==========
+
 def get_embedder(model_name: str):
     try:
         from sentence_transformers import SentenceTransformer
@@ -225,6 +343,7 @@ def encode_texts(embedder, texts: List[str], batch_size: int = 64) -> np.ndarray
     return vecs.astype(np.float32)
 
 # ========== 1) BUILD-INDEX ==========
+
 def cmd_build_index(args):
     t0 = time.time()
     os.makedirs(args.out_dir, exist_ok=True)
@@ -234,10 +353,18 @@ def cmd_build_index(args):
     chunks = []
     bm25_docs_tokens = []
 
-    h1_size, h1_ov = args.h1_size, args.h1_overlap
-    h2_size, h2_ov = args.h2_size, args.h2_overlap
+    # параметры семантического сплиттера
+    h1_size = args.h1_size
+    h2_size = args.h2_size
+    h1_min = getattr(args, "h1_min_chars", 300)
+    h2_min = getattr(args, "h2_min_chars", 120)
+    sem_thr = getattr(args, "sem_threshold", 0.6)
 
-    print(f"[build] reading {len(df)} docs, chunking H1={h1_size}/{h1_ov}, H2={h2_size}/{h2_ov}")
+    print(f"[build] reading {len(df)} docs, semantic chunking H1≈{h1_size}, H2≈{h2_size}, sem_thr={sem_thr}")
+
+    # создаём embedder один раз
+    embedder = get_embedder(args.embed_model)
+
     for _, row in df.iterrows():
         web_id = str(row["web_id"])
         title = normalize_text(str(row["title"]))
@@ -245,7 +372,16 @@ def cmd_build_index(args):
         typ = str(row["kind"])
         text = normalize_text(str(row["text"]))
 
-        for idx, (i, j, chunk) in enumerate(sliding_windows(text, h1_size, h1_ov)):
+        # H1 – крупные смысловые куски
+        chunks_h1 = semantic_split(
+            text,
+            embedder=embedder,
+            max_chars=h1_size,
+            min_chars=h1_min,
+            sim_threshold=sem_thr,
+            batch_size=args.batch,
+        )
+        for idx, chunk in enumerate(chunks_h1):
             chunk_id = f"{web_id}#h1#{idx:05d}"
             chunks.append({
                 "chunk_id": chunk_id,
@@ -257,7 +393,16 @@ def cmd_build_index(args):
                 "level": "h1"
             })
 
-        for idx, (i, j, chunk) in enumerate(sliding_windows(text, h2_size, h2_ov)):
+        # H2 – более мелкие куски
+        chunks_h2 = semantic_split(
+            text,
+            embedder=embedder,
+            max_chars=h2_size,
+            min_chars=h2_min,
+            sim_threshold=sem_thr,
+            batch_size=args.batch,
+        )
+        for idx, chunk in enumerate(chunks_h2):
             chunk_id = f"{web_id}#h2#{idx:05d}"
             chunks.append({
                 "chunk_id": chunk_id,
@@ -286,7 +431,6 @@ def cmd_build_index(args):
     print(f"[build] bm25 index saved: {bm25_path} (avgdl={bm25.avgdl:.2f}, vocab={len(bm25.idf)})")
 
     # Embeddings for H1/H2 separately (plain dense, без ANN)
-    embedder = get_embedder(args.embed_model)
     texts_h1 = [ch["text"] for ch in chunks if ch["level"] == "h1"]
     texts_h2 = [ch["text"] for ch in chunks if ch["level"] == "h2"]
     print(f"[build] encoding H1 ({len(texts_h1)})")
@@ -316,6 +460,7 @@ def cmd_build_index(args):
     print(f"[build] done in {time.time() - t0:.1f}s")
 
 # ========== 2) RETRIEVE ==========
+
 def load_chunks(path: str) -> List[Dict]:
     out = []
     with open(path, "r", encoding="utf-8") as f:
@@ -349,7 +494,6 @@ def cmd_retrieve(args):
     emb_h1 = np.load(os.path.join(out_dir, "emb_h1.npy"))
     emb_h2 = np.load(os.path.join(out_dir, "emb_h2.npy"))
 
-    # на случай, если там один вектор и shape == (D,)
     if emb_h1.ndim == 1:
         emb_h1 = emb_h1.reshape(1, -1)
     if emb_h2.ndim == 1:
@@ -451,6 +595,7 @@ def cmd_retrieve(args):
         print(f"[retrieve][eval] pool_recall={pool_recall:.4f} over {n} queries")
 
 # ========== 3) RERANK (light mix) ==========
+
 def cmd_rerank(args):
     t0 = time.time()
     df = pd.read_csv(args.candidates)
@@ -483,6 +628,7 @@ def cmd_rerank(args):
     print(f"[rerank] done in {time.time() - t0:.1f}s")
 
 # ========== 4) AGGREGATE ==========
+
 def logsumexp(a: np.ndarray, axis=None, keepdims=False):
     amax = np.max(a, axis=axis, keepdims=True)
     out = amax + np.log(np.sum(np.exp(a - amax), axis=axis, keepdims=True) + 1e-12)
@@ -525,8 +671,8 @@ def cmd_aggregate(args):
         print(f"[aggregate][eval] hit@5={hit5:.4f} over {n} queries")
 
 # ========== 5) SUBMIT ==========
+
 def cmd_submit(args):
-    import json
     t0 = time.time()
     df = pd.read_csv(args.docs)
     out_rows = []
@@ -548,8 +694,11 @@ def cmd_submit(args):
             uniq.append(uniq[-1])
 
         def to_int_safe(x):
-            try: return int(x)
-            except: return x
+            try:
+                return int(x)
+            except:
+                return x
+
         web_list = [to_int_safe(x) for x in uniq[:K]]
 
         out_rows.append({
@@ -569,17 +718,19 @@ def cmd_submit(args):
         print(f"[submit][eval] final hit@{K}={hit5:.4f} over {n} queries")
 
 # ========== CLI ==========
+
 def main():
     p = argparse.ArgumentParser(description="Minimal RAG retrieval core")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    b = sub.add_parser("build-index", help="Ingest → Chunk → BM25+Embeddings")
+    b = sub.add_parser("build-index", help="Ingest → SemanticChunk → BM25+Embeddings")
     b.add_argument("--corpus", required=True, help="CSV with columns: web_id,url,title,type,text")
     b.add_argument("--out-dir", required=True)
-    b.add_argument("--h1-size", type=int, default=1000)
-    b.add_argument("--h1-overlap", type=int, default=200)
-    b.add_argument("--h2-size", type=int, default=300)
-    b.add_argument("--h2-overlap", type=int, default=60)
+    b.add_argument("--h1-size", type=int, default=1000, help="целевой размер семантического чанка H1 в символах")
+    b.add_argument("--h2-size", type=int, default=350, help="целевой размер семантического чанка H2 в символах")
+    b.add_argument("--h1-min-chars", type=int, default=300, help="минимальный размер чанка H1")
+    b.add_argument("--h2-min-chars", type=int, default=120, help="минимальный размер чанка H2")
+    b.add_argument("--sem-threshold", type=float, default=0.6, help="порог cosine similarity для разрыва темы")
     b.add_argument("--k1", type=float, default=1.4)
     b.add_argument("--b", type=float, default=0.35)
     b.add_argument("--embed-model", default="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
